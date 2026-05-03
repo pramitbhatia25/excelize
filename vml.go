@@ -538,6 +538,23 @@ func (f *File) vmlDrawingWriter() {
 
 // addVMLObject provides a function to create VML drawing parts and
 // relationships for comments and form controls.
+//
+// Note on the comments/VML index relationship: historically this function
+// derived the comments file index from the legacy VML drawing index, i.e.
+// it wrote `xl/commentsN.xml` where N matched `xl/drawings/vmlDrawingN.vml`.
+// That identity is only preserved for files excelize created itself. Real
+// workbooks can have VML drawings allocated for ActiveX controls, form
+// controls, scroll bars, etc., so the numbering drifts and using the VML
+// index for the comments file causes two distinct corruptions:
+//
+//  1. The write lands inside some OTHER sheet's existing `commentsN.xml`,
+//     superimposing comments onto a sheet they don't belong to.
+//  2. The write lands in a brand new `commentsN.xml` with no sheet rel
+//     pointing at it, orphaning the comment.
+//
+// To avoid both, comment-mode now resolves the comments index independently
+// of the VML index: reuse whatever the sheet's rels already declare, else
+// allocate the next globally-free index.
 func (f *File) addVMLObject(opts vmlOptions) error {
 	// Read sheet data
 	ws, err := f.workSheetReader(opts.sheet)
@@ -571,16 +588,172 @@ func (f *File) addVMLObject(opts vmlOptions) error {
 		return err
 	}
 	if !opts.formCtrl {
-		commentsXML := "xl/comments" + strconv.Itoa(vmlID) + ".xml"
+		commentsIdx, commentsXML := f.resolveCommentsTarget(sheetXMLPath, sheetRels, vmlID)
 		if err = f.addComment(commentsXML, opts); err != nil {
 			return err
 		}
-		if sheetXMLPath, ok := f.getSheetXMLPath(opts.sheet); ok && f.getSheetComments(filepath.Base(sheetXMLPath)) == "" {
-			sheetRelationshipsComments := "../comments" + strconv.Itoa(vmlID) + ".xml"
-			f.addRels(sheetRels, SourceRelationshipComments, sheetRelationshipsComments, "")
-		}
+		return f.addContentTypePart(commentsIdx, "comments")
 	}
 	return f.addContentTypePart(vmlID, "comments")
+}
+
+// resolveCommentsTarget picks the xl/commentsN.xml path this AddComment
+// invocation should write into, and ensures the sheet has a relationship to
+// it. Selection order:
+//
+//  1. If the sheet's rels already declare a comments target, reuse it (this
+//     preserves existing comments on that sheet).
+//  2. Otherwise, if `xl/comments<vmlID>.xml` is not already claimed by any
+//     sheet and not already present in the archive, use it (keeps behavior
+//     identical to the historical excelize-generated workbook case where
+//     vmlDrawingN and commentsN share an index).
+//  3. Otherwise, allocate the smallest globally-unused commentsN.xml index
+//     and add a new comments relationship to this sheet pointing at it.
+//
+// The returned (idx, path) is the comments file this call will write to.
+func (f *File) resolveCommentsTarget(sheetXMLPath, sheetRels string, vmlID int) (int, string) {
+	if sheetXMLPath != "" {
+		if existing := f.getSheetComments(filepath.Base(sheetXMLPath)); existing != "" {
+			commentsXML := "xl" + strings.TrimPrefix(existing, "..")
+			commentsXML = strings.TrimPrefix(commentsXML, "/")
+			if idx, ok := parseCommentsIdx(commentsXML); ok {
+				return idx, commentsXML
+			}
+		}
+	}
+
+	// vmlID is a candidate only if the comments file at that index is NOT
+	// already owned by a different sheet. `countComments` plus presence in
+	// Pkg / f.Comments tells us whether the file exists; ownership by a
+	// different sheet means using vmlID here would superimpose our comment
+	// on that sheet.
+	if !f.commentsIdxClaimedByOtherSheet(vmlID, sheetXMLPath) &&
+		!f.commentsIdxExists(vmlID) {
+		commentsXML := "xl/comments" + strconv.Itoa(vmlID) + ".xml"
+		f.addRels(sheetRels, SourceRelationshipComments, "../comments"+strconv.Itoa(vmlID)+".xml", "")
+		return vmlID, commentsXML
+	}
+
+	// Allocate a brand new index.
+	idx := f.nextFreeCommentsIdx()
+	commentsXML := "xl/comments" + strconv.Itoa(idx) + ".xml"
+	f.addRels(sheetRels, SourceRelationshipComments, "../comments"+strconv.Itoa(idx)+".xml", "")
+	return idx, commentsXML
+}
+
+// parseCommentsIdx extracts the numeric index N from a "xl/commentsN.xml"
+// path. Returns (0, false) if the path doesn't match.
+func parseCommentsIdx(path string) (int, bool) {
+	base := filepath.Base(path)
+	if !strings.HasPrefix(base, "comments") || !strings.HasSuffix(base, ".xml") {
+		return 0, false
+	}
+	digits := strings.TrimSuffix(strings.TrimPrefix(base, "comments"), ".xml")
+	if digits == "" {
+		return 0, false
+	}
+	n, err := strconv.Atoi(digits)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
+// commentsIdxExists reports whether xl/commentsN.xml is already present in
+// the archive or the in-memory Comments map.
+func (f *File) commentsIdxExists(n int) bool {
+	target := "xl/comments" + strconv.Itoa(n) + ".xml"
+	if _, ok := f.Pkg.Load(target); ok {
+		return true
+	}
+	if _, ok := f.Comments[target]; ok {
+		return true
+	}
+	return false
+}
+
+// commentsIdxClaimedByOtherSheet reports whether any sheet OTHER THAN the
+// one at currentSheetXMLPath has a comments relationship pointing at
+// xl/commentsN.xml.
+func (f *File) commentsIdxClaimedByOtherSheet(n int, currentSheetXMLPath string) bool {
+	want := "../comments" + strconv.Itoa(n) + ".xml"
+	altWant := "/xl/comments" + strconv.Itoa(n) + ".xml"
+	currentBase := filepath.Base(currentSheetXMLPath)
+	claimed := false
+	f.Pkg.Range(func(k, _ interface{}) bool {
+		key, _ := k.(string)
+		if !strings.HasPrefix(key, "xl/worksheets/_rels/sheet") || !strings.HasSuffix(key, ".xml.rels") {
+			return true
+		}
+		sheetFile := strings.TrimSuffix(strings.TrimPrefix(key, "xl/worksheets/_rels/"), ".rels")
+		if sheetFile == currentBase {
+			return true
+		}
+		rels, _ := f.relsReader(key)
+		if rels == nil {
+			return true
+		}
+		rels.mu.Lock()
+		for _, rel := range rels.Relationships {
+			if rel.Type != SourceRelationshipComments {
+				continue
+			}
+			if rel.Target == want || rel.Target == altWant {
+				claimed = true
+				break
+			}
+		}
+		rels.mu.Unlock()
+		return !claimed
+	})
+	return claimed
+}
+
+// nextFreeCommentsIdx returns the smallest N >= 1 such that
+// xl/commentsN.xml does not exist anywhere in the archive or in-memory
+// state and is not referenced by any sheet rels.
+func (f *File) nextFreeCommentsIdx() int {
+	used := map[int]struct{}{}
+	f.Pkg.Range(func(k, _ interface{}) bool {
+		if key, ok := k.(string); ok {
+			if n, ok := parseCommentsIdx(key); ok {
+				used[n] = struct{}{}
+			}
+		}
+		return true
+	})
+	for rel := range f.Comments {
+		if n, ok := parseCommentsIdx(rel); ok {
+			used[n] = struct{}{}
+		}
+	}
+	// Also walk sheet rels in case an entry was written with no content yet.
+	f.Pkg.Range(func(k, _ interface{}) bool {
+		key, _ := k.(string)
+		if !strings.HasPrefix(key, "xl/worksheets/_rels/sheet") || !strings.HasSuffix(key, ".xml.rels") {
+			return true
+		}
+		rels, _ := f.relsReader(key)
+		if rels == nil {
+			return true
+		}
+		rels.mu.Lock()
+		for _, rel := range rels.Relationships {
+			if rel.Type != SourceRelationshipComments {
+				continue
+			}
+			if n, ok := parseCommentsIdx(rel.Target); ok {
+				used[n] = struct{}{}
+			}
+		}
+		rels.mu.Unlock()
+		return true
+	})
+	for i := 1; ; i++ {
+		if _, ok := used[i]; !ok {
+			return i
+		}
+	}
 }
 
 // prepareFormCtrlOptions provides a function to parse the format settings of
